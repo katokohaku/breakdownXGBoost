@@ -1,0 +1,403 @@
+---
+title: "XGBoostExplainerが何をやっているか調べる"
+author: Satoshi Kato (@katokohaku)
+output: 
+  html_document:
+    keep_md: no
+    toc: yes
+  md_document:
+    variant: markdown_github
+---
+
+```{r setup, include=FALSE}
+require(tidyverse)
+require(magrittr)
+
+knitr::opts_knit$set(
+  progress = TRUE, 
+  verbose = TRUE, 
+  root.dir = "."
+)
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE
+)
+```
+
+
+# 目的
+
+XGBoostの予測を分解するツール`XGBoostExplainer`は、あるインスタンスについて得られたXGBoostによる予測結果が、どのように構成されているか可視化してくれる。
+
+<img src="img/sample.png" width="400">
+
+コンセプトとしては、randomforestにおけるforestfloorと同じく、feature contributionの考え方を、個々のインスタンスのxgboostによる予測結果の可視化のために適用している。
+
+探索的なデータ分析に使うだけならおおむね問題ないが、論文などの詳細な資料が見つけられなかったため、具体的に何をやっているか説明しようとして困った。そこで、`XGBoostExplainer`の実装を追いかけて、何をやっているか調べた。
+
+## まとめ
+
+1. とりあえず使ってみる
+2. 予測結果の可視化プロセスをstep-by-stepで実行する
+3. 学習したxgboostのルール抽出をstep-by-stepで実行する
+4. 予測結果のbreakdownをstep-by-stepで実行する
+
+## 参考
+
+開発元の紹介記事
+
+> [NEW R package that makes XGBoost   interpretable](https://medium.com/applied-data-science/new-r-package-the-xgboost-explainer-51dd7d1aa211)
+
+日本語の紹介記事（使い方など）
+
+> [xgboost の中を覗いてみる](https://qiita.com/vascoosx/items/efb3177ecf2ead5d8ce0)
+
+# とりあえず使ってみる
+
+## インストール
+
+本家の記事に従ってgithubからインストール
+
+```{r install.package, eval=FALSE}
+install.packages("devtools") 
+library(devtools) 
+install_github("AppliedDataSciencePartners/xgboostExplainer")
+```
+## XGBモデルの学習と予測
+
+`xgboostExplainer`のマニュアルにあるexampleからコピペ。
+
+今回は`xgboost`パッケージ付属のサンプルデータで、いつもの食えるキノコと毒キノコの2値分類。細かいチューニングは、必要に応じてautoxgbあたりでチューニングするとよいが、今回は省略。
+
+```{r train.and.predict, message=FALSE, results="hide"}
+library(xgboost)
+require(tidyverse)
+library(xgboost)
+library(xgboostExplainer)
+
+set.seed(123)
+
+data(agaricus.train, package='xgboost')
+
+X = as.matrix(agaricus.train$data)
+y = agaricus.train$label
+table(y)
+train_idx = 1:5000
+
+train.data = X[train_idx,]
+test.data = X[-train_idx,]
+
+xgb.train.data <- xgb.DMatrix(train.data, label = y[train_idx])
+xgb.test.data <- xgb.DMatrix(test.data)
+
+param <- list(objective = "binary:logistic")
+xgb.model <- xgboost(param =param,  data = xgb.train.data, nrounds=3)
+
+col_names = colnames(X)
+
+pred.train = predict(xgb.model,X)
+nodes.train = predict(xgb.model,X,predleaf =TRUE)
+trees = xgb.model.dt.tree(col_names, model = xgb.model)
+
+```
+
+## 個別の予測結果の可視化
+
+`xgboostExplainer`のマニュアルにあるexampleのコピペ（つづき）。高度にwrapされているためわずか3行でstep-by-stepが完了する。
+
+### STEP.1. 学習済みXGBモデルからルールセット（leafまでのパス）を列挙してテーブル化
+
+`base_score`オプションはxgboostのオプションそのままで、ターゲット集団のクラス不均衡を表す事前確率。すなわち正例：負例＝300:700を仮定できる対象であれば、`base_score = 0.3`となる(デフォルトは1:1を表す0.5)。
+
+```{r}
+library(xgboostExplainer)
+
+explainer = buildExplainer(xgb.model,xgb.train.data, type="binary", base_score = 0.5, trees = NULL)
+
+```
+### STEP.2. Get multiple prediction breakdowns from a trained xgboost model
+
+マニュアルには step2とあるのだが、実はパッケージを使うだけならスキップできてしまう。
+
+### STEP.3. 予測対象(インスタンス)に適用される各treeのパスを集計して可視化
+
+2値分類(`binary:logistic`)では、片側のクラスに属する確率p（左軸の数値）のロジット（対数オッズ；棒グラフ中の数値）が足し合わされている様子を表示する。
+
+```{r, message=FALSE}
+showWaterfall(xgb.model, explainer, xgb.test.data, test.data,  2, type = "binary")
+
+```
+
+(参考) `binary:logistic`の場合、`base_score`で設定した事前確率は ベースラインとしてinterceptに反映される。下記の例ではinterceptだけが下がっていることに注目されたい。
+
+```{r, results="hide", message=FALSE}
+explainer = buildExplainer(xgb.model,xgb.train.data, type="binary", base_score = 0.2, trees = NULL)
+
+```
+```{r, message=FALSE}
+showWaterfall(xgb.model, explainer, xgb.test.data, test.data,  2, type = "binary")
+
+```
+
+# 予測結果の可視化プロセスをstep-by-stepで実行する
+
+これ以降では、`binary:logistic`を扱って進める。`objective = "reg:linear"`はよりシンプルな手続きであり、前者がわかれば自然に理解できる。
+
+`showWaterfall(..., type = "binary")`の中身を抜き書きしながら眺めていく
+
+## breakdownの取り出し
+
+`showWaterfall()`のなかでも指定したインスタンスに対して`explainPredictions()`が呼び出されており、`buildExplainer()`と`explainPredictions()`が中核機能を担当していることがわかる。が、その処理は後述することにして、ここではまず、xgboostのモデルと予測結果から**何が取り出され、どう捌かれているかだけ**をフォーカスして追いかける。
+
+```{r}
+# showWaterfall(xgb.model, explainer, xgb.test.data, test.data,  2, type = "binary")
+
+DMatrix = xgb.test.data
+data.matrix = test.data
+idx = 2
+type = "binary"
+threshold = 1e-04
+limits = c(NA, NA)
+
+
+breakdown = explainPredictions(xgb.model, explainer, slice(DMatrix, as.integer(idx)))
+weight = rowSums(breakdown)
+pred = 1/(1 + exp(-weight))
+breakdown_summary = as.matrix(breakdown)[1, ]
+
+breakdown_summary %>% tail()
+```
+
+## breakdownの集計
+
+Dmatrixの各Featureの貢献度の値とラベルを抜き出して、 Interceptとそれ以外に分割
+
+```{r}
+data_for_label = data.matrix[idx, ]
+i = order(abs(breakdown_summary), decreasing = TRUE)
+breakdown_summary = breakdown_summary[i]
+data_for_label = data_for_label[i]
+
+```
+
+Intercept以外をソートしたのち`threshold`未満の特徴量を除外
+
+```{r}
+intercept = breakdown_summary[names(breakdown_summary) == "intercept"]
+data_for_label = data_for_label[names(breakdown_summary) != "intercept"]
+breakdown_summary = breakdown_summary[names(breakdown_summary) != "intercept"]
+
+```
+
+`threshold`未満の特徴量を除外して、`other_impact`としてまとめたのち、`other_impact`がゼロでなければ`intercept, breakdown_summary, other_impact`の順番に並べる。やたら細かいルールがいっぱい生えちゃった（えてしてtree depthのチューニングに失敗してoverfitしてそうではあるが）とかでもない限り`threshold`はデフォルトのままで良さそう。
+
+```{r}
+
+i_other = which(abs(breakdown_summary) < threshold)
+other_impact = 0
+if (length(i_other > 0)) {
+  other_impact = sum(breakdown_summary[i_other])
+  names(other_impact) = "other"
+  breakdown_summary = breakdown_summary[-i_other]
+  data_for_label = data_for_label[-i_other]
+}
+if (abs(other_impact) > 0) {
+  breakdown_summary = c(intercept, breakdown_summary, other_impact)
+  data_for_label = c("", data_for_label, "")
+  labels = paste0(names(breakdown_summary), " = ", data_for_label)
+  labels[1] = "intercept"
+  labels[length(labels)] = "other"
+} else {
+  breakdown_summary = c(intercept, breakdown_summary)
+  data_for_label = c("", data_for_label)
+  labels = paste0(names(breakdown_summary), " = ", data_for_label)
+  labels[1] = "intercept"
+}
+```
+
+## 予測値への変換と可視化
+
+算出した値の出力。`getinfo`の箇所はラベルの実名か何かを取ろうとしてる？　キノコのデータだとスキップ。 
+```{r}
+
+if (!is.null(getinfo(DMatrix, "label"))) {
+  cat("\nActual: ", getinfo(slice(DMatrix, as.integer(idx)), "label"))
+}
+cat("\nPrediction: ", pred)
+cat("\nWeight: ", weight)
+cat("\nBreakdown")
+cat("\n")
+print(breakdown_summary)
+
+```
+`inverse_logit_trans`はレガシー？　コメントアウトしても動作する。  
+`inverse_logit_labels`と`logit`は、y軸を対数オッズからクラス所属確率に読み替えるための関数。
+
+```{r}
+inverse_logit_trans <- scales::trans_new("inverse logit", transform = plogis, inverse = qlogis)
+
+inverse_logit_labels = function(x) {
+  return(1/(1 + exp(-x)))
+}
+
+logit = function(x) {
+  return(log(x/(1 - x)))
+}
+
+ybreaks <- logit(seq(2, 98, 2)/100)
+
+waterfalls::waterfall(
+  values = breakdown_summary,
+  rect_text_labels = round(breakdown_summary, 2),
+  labels = labels, 
+  total_rect_text = round(weight, 2),
+  calc_total = TRUE,
+  total_axis_text = "Prediction") + 
+  scale_y_continuous(labels = inverse_logit_labels,
+                     breaks = ybreaks, 
+                     limits = limits) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+`waterfalls::waterfall`は、外部のライブラリなので、[開発元](https://jameshoward.us/software/waterfall/)を参照されたい。
+
+# 学習したxgboostのルール抽出をstep-by-stepで実行する
+
+```{r}
+# explainer = buildExplainer(xgb.model,xgb.train.data, type="binary", base_score = 0.5, trees = NULL)
+# function (xgb.model, trainingData, type = "binary", base_score = 0.5, trees_idx = NULL) 
+# {
+trainingData = xgb.train.data
+type = "binary" 
+base_score = 0.5
+trees_idx = NULL
+col_names = attr(trainingData, ".Dimnames")[[2]]
+col_names
+
+cat("\nCreating the trees of the xgboost model...")
+trees = xgb.model.dt.tree(col_names, model = xgb.model, trees = trees_idx)
+
+str(trees)
+
+```
+
+```{r}
+
+cat("\nGetting the leaf nodes for the training set observations...")
+nodes.train = predict(xgb.model, trainingData, predleaf = TRUE)
+
+```
+
+```{r, eval=FALSE}
+# cat("\nBuilding the Explainer...")
+# cat("\n\nSTEP 2 of 2")
+# tree_list = xgboostExplainer:::getStatsForTrees(trees, nodes.train, type = type, base_score = base_score)
+function (trees, nodes.train, type = "binary", base_score = 0.5) 
+{
+  tree_list = copy(trees)
+  tree_list[, `:=`(leaf, Feature == "Leaf")]
+  tree_list[, `:=`(H, Cover)]
+  non.leaves = which(tree_list[, leaf] == F)
+  cat("\n\nRecalculating the cover for each non-leaf... \n")
+  pb <- txtProgressBar(style = 3)
+  j = 0
+  for (i in rev(non.leaves)) {
+    left = tree_list[i, Yes]
+    right = tree_list[i, No]
+    tree_list[i, `:=`(H, tree_list[ID == left, H] + tree_list[ID == right, H])]
+    j = j + 1
+    setTxtProgressBar(pb, j/length(non.leaves))
+  }
+  if (type == "regression") {
+    base_weight = base_score
+  }
+  else {
+    base_weight = log(base_score/(1 - base_score))
+  }
+  tree_list[leaf == T, `:=`(weight, base_weight + Quality)]
+  tree_list[, `:=`(previous_weight, base_weight)]
+  tree_list[1, `:=`(previous_weight, 0)]
+  tree_list[leaf == T, `:=`(G, -weight * H)]
+  tree_list = split(tree_list, as.factor(tree_list$Tree))
+  num_tree_list = length(tree_list)
+  treenums = as.character(0:(num_tree_list - 1))
+  t = 0
+  cat("\n\nFinding the stats for the xgboost trees...\n")
+  pb <- txtProgressBar(style = 3)
+  for (tree in tree_list) {
+    t = t + 1
+    num_nodes = nrow(tree)
+    non_leaf_rows = rev(which(tree[, leaf] == F))
+    for (r in non_leaf_rows) {
+      left = tree[r, Yes]
+      right = tree[r, No]
+      leftG = tree[ID == left, G]
+      rightG = tree[ID == right, G]
+      tree[r, `:=`(G, leftG + rightG)]
+      w = tree[r, -G/H]
+      tree[r, `:=`(weight, w)]
+      tree[ID == left, `:=`(previous_weight, w)]
+      tree[ID == right, `:=`(previous_weight, w)]
+    }
+    tree[, `:=`(uplift_weight, weight - previous_weight)]
+    setTxtProgressBar(pb, t/num_tree_list)
+  }
+  return(tree_list)
+}
+
+```
+
+```{r, eval=FALSE}
+# cat("\n\nSTEP 2 of 2")
+# explainer = xgboostExplainer:::buildExplainerFromTreeList(tree_list, col_names)
+function (tree_list, col_names) 
+{
+  tree_list_breakdown <- vector("list", length(col_names) + 3)
+  names(tree_list_breakdown) = c(col_names, "intercept", "leaf", "tree")
+  num_trees = length(tree_list)
+  cat("\n\nGetting breakdown for each leaf of each tree...\n")
+  pb <- txtProgressBar(style = 3)
+  for (x in 1:num_trees) {
+    tree = tree_list[[x]]
+    tree_breakdown = getTreeBreakdown(tree, col_names)
+    tree_breakdown$tree = x - 1
+    tree_list_breakdown = rbindlist(append(list(tree_list_breakdown), list(tree_breakdown)))
+    setTxtProgressBar(pb, x/num_trees)
+  }
+  return(tree_list_breakdown)
+}
+
+```
+
+
+# 予測結果のbreakdownをstep-by-stepで実行する
+
+```{r, eval=FALSE}
+# breakdown = explainPredictions(xgb.model, explainer, slice(DMatrix, as.integer(idx)))
+# function (xgb.model, explainer, data) 
+# {
+nodes = predict(xgb.model, data, predleaf = TRUE)
+colnames = names(explainer)[1:(ncol(explainer) - 2)]
+
+preds_breakdown = data.table(matrix(0, nrow = nrow(nodes), ncol = length(colnames)))
+setnames(preds_breakdown, colnames)
+
+num_trees = ncol(nodes)
+
+cat("\n\nExtracting the breakdown of each prediction...\n")
+pb <- txtProgressBar(style = 3)
+for (x in 1:num_trees) {
+  nodes_for_tree = nodes[, x]
+  tree_breakdown = explainer[tree == x - 1]
+  preds_breakdown_for_tree = tree_breakdown[match(nodes_for_tree, tree_breakdown$leaf), ]
+  preds_breakdown = preds_breakdown + preds_breakdown_for_tree[, colnames, with = FALSE]
+  setTxtProgressBar(pb, x/num_trees)
+}
+cat("\n\nDONE!\n")
+#   return(preds_breakdown)
+# }
+
+```
+
