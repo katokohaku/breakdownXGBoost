@@ -1,0 +1,199 @@
+---
+title: "XGBoostExplainerが何をやっているか調べる"
+author: Satoshi Kato (@katokohaku)
+output: 
+  html_document:
+    keep_md: yes
+    toc: yes
+  md_document:
+    variant: markdown_github
+---
+
+```{r setup, include=FALSE}
+require(tidyverse)
+require(magrittr)
+
+knitr::opts_knit$set(
+  progress = TRUE, 
+  verbose = TRUE, 
+  root.dir = "."
+)
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE
+)
+```
+
+# 目的
+
+今回は、`xgboostExplainer`によって、xgboostのモデルと予測結果から**何が取り出され、どう捌かれているか**にフォーカスして追いかける。
+
+# 関連シリーズ
+
+1. とりあえず使ってみる
+2. 予測結果の可視化プロセスをstep-by-stepで実行する（この記事）
+3. 学習したxgboostのルール抽出をstep-by-stepで実行する
+4. 予測結果のbreakdownをstep-by-stepで実行する
+
+
+# `showWaterfall(..., type = "binary")`の中身を抜き書きしながら眺める
+
+予測結果の可視化プロセスをstep-by-stepで実行する
+
+これ以降、`objective = "binary:logistic"`を扱って進める。`objective = "reg:linear"`はよりシンプルな手続きであり、前者がわかれば自然に理解できる。
+
+## 準備：XGBモデルの学習と予測
+
+`xgboostExplainer`のマニュアルにあるexampleからコピペ。
+
+```{r train.and.predict, message=FALSE, results="hide"}
+require(tidyverse)
+library(xgboost)
+library(xgboostExplainer)
+
+set.seed(123)
+
+data(agaricus.train, package='xgboost')
+
+X = as.matrix(agaricus.train$data)
+y = agaricus.train$label
+table(y)
+train_idx = 1:5000
+
+train.data = X[train_idx,]
+test.data = X[-train_idx,]
+
+xgb.train.data <- xgb.DMatrix(train.data, label = y[train_idx])
+xgb.test.data <- xgb.DMatrix(test.data)
+
+param <- list(objective = "binary:logistic")
+xgb.model <- xgboost(param =param,  data = xgb.train.data, nrounds=3)
+
+```
+
+## breakdownの取り出し
+
+`showWaterfall()`のなかでも指定したインスタンスに対して`explainPredictions()`が呼び出されており、`buildExplainer()`と`explainPredictions()`が中核機能を担当していることがわかる。
+
+```{r}
+library(xgboostExplainer)
+
+explainer = buildExplainer(xgb.model,xgb.train.data, type="binary", base_score = 0.5, trees = NULL)
+
+```
+
+```{r}
+# showWaterfall(xgb.model, explainer, xgb.test.data, test.data,  2, type = "binary")
+
+DMatrix = xgb.test.data
+data.matrix = test.data
+idx = 2
+type = "binary"
+threshold = 1e-04
+limits = c(NA, NA)
+
+
+breakdown = explainPredictions(xgb.model, explainer, slice(DMatrix, as.integer(idx)))
+weight = rowSums(breakdown)
+pred = 1/(1 + exp(-weight))
+breakdown_summary = as.matrix(breakdown)[1, ]
+
+breakdown_summary %>% tail()
+```
+
+## breakdownの集計
+
+Dmatrixの各Featureの貢献度の値とラベルを抜き出して、 Interceptとそれ以外に分割
+
+```{r}
+data_for_label = data.matrix[idx, ]
+i = order(abs(breakdown_summary), decreasing = TRUE)
+breakdown_summary = breakdown_summary[i]
+data_for_label = data_for_label[i]
+
+```
+
+Intercept以外をソートしたのち`threshold`未満の特徴量を除外
+
+```{r}
+intercept = breakdown_summary[names(breakdown_summary) == "intercept"]
+data_for_label = data_for_label[names(breakdown_summary) != "intercept"]
+breakdown_summary = breakdown_summary[names(breakdown_summary) != "intercept"]
+
+```
+
+`threshold`未満の特徴量を除外して、`other_impact`としてまとめたのち、`other_impact`がゼロでなければ`intercept, breakdown_summary, other_impact`の順番に並べる。やたら細かいルールがいっぱい生えちゃった（tree depthのチューニングに失敗してoverfitしてそうではあるが）とかでもない限り`threshold`はデフォルトのままで良さそう。
+
+```{r}
+
+i_other = which(abs(breakdown_summary) < threshold)
+other_impact = 0
+if (length(i_other > 0)) {
+  other_impact = sum(breakdown_summary[i_other])
+  names(other_impact) = "other"
+  breakdown_summary = breakdown_summary[-i_other]
+  data_for_label = data_for_label[-i_other]
+}
+if (abs(other_impact) > 0) {
+  breakdown_summary = c(intercept, breakdown_summary, other_impact)
+  data_for_label = c("", data_for_label, "")
+  labels = paste0(names(breakdown_summary), " = ", data_for_label)
+  labels[1] = "intercept"
+  labels[length(labels)] = "other"
+} else {
+  breakdown_summary = c(intercept, breakdown_summary)
+  data_for_label = c("", data_for_label)
+  labels = paste0(names(breakdown_summary), " = ", data_for_label)
+  labels[1] = "intercept"
+}
+```
+
+## 予測値への変換と可視化
+
+算出した値の出力。`getinfo`の箇所はラベルの実名か何かを取ろうとしてる？　キノコのデータだとスキップ。 
+```{r}
+
+if (!is.null(getinfo(DMatrix, "label"))) {
+  cat("\nActual: ", getinfo(slice(DMatrix, as.integer(idx)), "label"))
+}
+cat("\nPrediction: ", pred)
+cat("\nWeight: ", weight)
+cat("\nBreakdown")
+cat("\n")
+print(breakdown_summary)
+
+```
+`inverse_logit_trans`はレガシー？　コメントアウトしても動作する。  
+`inverse_logit_labels`と`logit`は、y軸を対数オッズからクラス所属確率に読み替えるための関数。
+
+```{r}
+inverse_logit_trans <- scales::trans_new("inverse logit", transform = plogis, inverse = qlogis)
+
+inverse_logit_labels = function(x) {
+  return(1/(1 + exp(-x)))
+}
+
+logit = function(x) {
+  return(log(x/(1 - x)))
+}
+
+ybreaks <- logit(seq(2, 98, 2)/100)
+
+waterfalls::waterfall(
+  values = breakdown_summary,
+  rect_text_labels = round(breakdown_summary, 2),
+  labels = labels, 
+  total_rect_text = round(weight, 2),
+  calc_total = TRUE,
+  total_axis_text = "Prediction") + 
+  scale_y_continuous(labels = inverse_logit_labels,
+                     breaks = ybreaks, 
+                     limits = limits) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+`waterfalls::waterfall`は、外部のライブラリなので、[開発元](https://jameshoward.us/software/waterfall/)を参照されたい。
+
+次回は、学習したxgboostのモデルから`xgboostExplainer`がどのような手続きでルール抽出をしているのかを詳細に見ていく。
