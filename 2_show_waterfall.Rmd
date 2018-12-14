@@ -31,17 +31,17 @@ knitr::opts_chunk$set(
 
 # 関連シリーズ
 
-1. とりあえず使ってみる
+1. [とりあえず使ってみる](http://kato-kohaku-0.hatenablog.com/entry/2018/12/14/002253)
 2. 予測結果の可視化プロセスをstep-by-stepで実行する（この記事）
 3. 学習したxgboostのルール抽出をstep-by-stepで実行する
 4. 予測結果のbreakdownをstep-by-stepで実行する
 
 
-# `showWaterfall(..., type = "binary")`の中身を抜き書きしながら眺める
+# 予測結果の可視化プロセスをstep-by-stepで眺める
 
-予測結果の可視化プロセスをstep-by-stepで実行する
+`showWaterfall(..., type = "binary")`の中身を抜き書きしながら、都度、何が取り出されているか見ていく。
 
-これ以降、`objective = "binary:logistic"`を扱って進める。`objective = "reg:linear"`はよりシンプルな手続きであり、前者がわかれば自然に理解できる。
+なお、この記事以降では、`objective = "binary:logistic"`を扱って進める。`objective = "reg:linear"`はよりシンプルな手続きであり、前者がわかれば後者は自然に理解できる。
 
 ## 準備：XGBモデルの学習と予測
 
@@ -72,18 +72,59 @@ xgb.model <- xgboost(param =param,  data = xgb.train.data, nrounds=3)
 
 ```
 
-## breakdownの取り出し
+## 可視化の手続き(overview)
 
-`showWaterfall()`のなかでも指定したインスタンスに対して`explainPredictions()`が呼び出されており、`buildExplainer()`と`explainPredictions()`が中核機能を担当していることがわかる。
+あるインスタンスの予測結果を可視化する手順は：
 
-```{r}
+1. 学習したxgboostのモデルから予測ルールを抽出する
+2. `showWaterfall()`のなかで
+    1. 指定したインスタンスの予測結果を予測ルールから分解再構成する
+    2. 分解再構成した予測結果をwatarfall chartで可視化する
+
+なお、
+
+* `buildExplainer()`が**どうやって**モデルから予測ルールを抽出しているか
+* `explainPredictions()`が**どうやって**分解再構成するか
+
+については今回は触れない。
+
+### 学習したxgboostのモデルから予測ルールを抽出する
+
+`buildExplainer()`が抽出した予測ルール(ノード)を眺める。
+
+```{r, results="hide"}
 library(xgboostExplainer)
 
 explainer = buildExplainer(xgb.model,xgb.train.data, type="binary", base_score = 0.5, trees = NULL)
 
 ```
 
+今回はルールの数が多いので、一度も登場しないものを除外してみる：
+
 ```{r}
+nonzero.cols <- abs(explainer) %>% 
+  colSums() %>% 
+  is_greater_than(0.0) %>% 
+  which()
+
+explainer %>% 
+  select(nonzero.cols %>% rev()) %>% 
+  set_colnames(
+    colnames(.) %>% 
+      str_trunc(width=10, side="left"))
+
+
+```
+
+`nrounds = 3`に対応する`tree`が３、それぞれの木のleafにたどり着くためのルールの組み合わせと、更新される予測の量がわかる。
+
+
+### 指定したインスタンスの予測結果を予測ルールから分解再構成する
+
+
+指定したインスタンスの予測結果を、`buildExplainer()`が再構成した結果(rules breakdown)を眺める。
+
+```{r, results="hide"}
 # showWaterfall(xgb.model, explainer, xgb.test.data, test.data,  2, type = "binary")
 
 DMatrix = xgb.test.data
@@ -93,18 +134,32 @@ type = "binary"
 threshold = 1e-04
 limits = c(NA, NA)
 
-
 breakdown = explainPredictions(xgb.model, explainer, slice(DMatrix, as.integer(idx)))
-weight = rowSums(breakdown)
-pred = 1/(1 + exp(-weight))
-breakdown_summary = as.matrix(breakdown)[1, ]
 
-breakdown_summary %>% tail()
 ```
 
-## breakdownの集計
+ルールが多いので非ゼロのものだけ眺める。
+```{r}
+breakdown_summary = as.matrix(breakdown)[1, ]
+breakdown_summary[which(abs(breakdown_summary) > 0.0)]
 
-Dmatrixの各Featureの貢献度の値とラベルを抜き出して、 Interceptとそれ以外に分割
+```
+
+
+今回は、`objective = "binary:logistic"`なので、予測値(対数オッズ)は逆ロジット変換により予測結果(クラス所属確率)に変換される
+```{r}
+(weight = rowSums(breakdown))
+
+(pred = 1/(1 + exp(-weight)))
+
+```
+
+### 分解再構成した予測結果を可視化する
+
+プロットの方針は以下の通り。
+
+1. ベースライン(Intercept)を先頭に表示、残りをインパクト(貢献量)が大きい順に表示
+2. インパクトが微小(`< threshold`)のルールは、その他(`other_impact`)にまとめる
 
 ```{r}
 data_for_label = data.matrix[idx, ]
@@ -112,21 +167,16 @@ i = order(abs(breakdown_summary), decreasing = TRUE)
 breakdown_summary = breakdown_summary[i]
 data_for_label = data_for_label[i]
 
-```
-
-Intercept以外をソートしたのち`threshold`未満の特徴量を除外
-
-```{r}
 intercept = breakdown_summary[names(breakdown_summary) == "intercept"]
 data_for_label = data_for_label[names(breakdown_summary) != "intercept"]
 breakdown_summary = breakdown_summary[names(breakdown_summary) != "intercept"]
 
 ```
 
-`threshold`未満の特徴量を除外して、`other_impact`としてまとめたのち、`other_impact`がゼロでなければ`intercept, breakdown_summary, other_impact`の順番に並べる。やたら細かいルールがいっぱい生えちゃった（tree depthのチューニングに失敗してoverfitしてそうではあるが）とかでもない限り`threshold`はデフォルトのままで良さそう。
+
+`threshold`の値はオプション指定で変更でき、インパクトの大きなルールだけに絞り込んで表示できる。やたら細かいルールがいっぱい生えちゃったとかでもない限り((tree depthのチューニングに失敗してoverfitしてそうではあるし、一つのインスタンスの説明用途としては失敗しているともいえる。))`threshold`はデフォルトのままで良さそう。
 
 ```{r}
-
 i_other = which(abs(breakdown_summary) < threshold)
 other_impact = 0
 if (length(i_other > 0)) {
@@ -147,11 +197,16 @@ if (abs(other_impact) > 0) {
   labels = paste0(names(breakdown_summary), " = ", data_for_label)
   labels[1] = "intercept"
 }
+
+breakdown_summary %>% t()
 ```
 
-## 予測値への変換と可視化
+頑張って並び替えた。
 
-算出した値の出力。`getinfo`の箇所はラベルの実名か何かを取ろうとしてる？　キノコのデータだとスキップ。 
+### watarfall chartによる予測結果の描画
+
+算出した値の出力。`getinfo`の箇所はラベルの実名か何かを取ろうとしてる？　キノコのデータだとスキップされる。
+
 ```{r}
 
 if (!is.null(getinfo(DMatrix, "label"))) {
@@ -164,8 +219,11 @@ cat("\n")
 print(breakdown_summary)
 
 ```
-`inverse_logit_trans`はレガシー？　コメントアウトしても動作する。  
-`inverse_logit_labels`と`logit`は、y軸を対数オッズからクラス所属確率に読み替えるための関数。
+
+
+予測結果(クラス所属確率)で表示するための工夫をする。`inverse_logit_labels`と`logit`は、y軸を対数オッズからクラス所属確率に読み替えるための関数。
+
+((inverse_logit_trans`はコメントアウトしても動作する。レガシーだろうか？))
 
 ```{r}
 inverse_logit_trans <- scales::trans_new("inverse logit", transform = plogis, inverse = qlogis)
@@ -194,6 +252,6 @@ waterfalls::waterfall(
 
 ```
 
-`waterfalls::waterfall`は、外部のライブラリなので、[開発元](https://jameshoward.us/software/waterfall/)を参照されたい。
+`waterfalls::waterfall()`は、外部のパッケージをそのまま利用する。[開発元](https://jameshoward.us/software/waterfall/)を参照されたい。
 
-次回は、学習したxgboostのモデルから`xgboostExplainer`がどのような手続きでルール抽出をしているのかを詳細に見ていく。
+次回は、`buildExplainer()`が、どのような手続きで指定したインスタンスの予測結果を分解再構成しているのか詳細に見ていく。
