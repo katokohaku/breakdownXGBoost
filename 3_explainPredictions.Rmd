@@ -1,0 +1,140 @@
+---
+title: "XGBoostExplainerが何をやっているか調べる"
+author: Satoshi Kato (@katokohaku)
+output: 
+  html_document:
+    keep_md: yes
+    toc: yes
+  md_document:
+    variant: markdown_github
+---
+
+```{r setup, include=FALSE}
+require(tidyverse)
+require(magrittr)
+
+knitr::opts_knit$set(
+  progress = TRUE, 
+  verbose = TRUE, 
+  root.dir = "."
+)
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE
+)
+```
+
+# 関連シリーズ
+
+1. [とりあえず使ってみる](http://kato-kohaku-0.hatenablog.com/entry/2018/12/14/002253)
+2. 予測結果の可視化プロセスをstep-by-stepで実行する（この記事）
+3. 予測結果のbreakdownをstep-by-stepで実行する
+4. 学習したxgboostのルール抽出をstep-by-stepで実行する
+
+# 目的
+
+今回は、インスタンスの予測結果を予測ルールから分解再構成するプロセスをstep-by-stepで眺める。
+`buildExplainer()`の中身を抜き書きしながら、都度、何が取り出されているか見ていく。
+
+
+## 準備：XGBモデルの学習と予測
+
+`xgboostExplainer`のマニュアルにあるexampleからコピペ。
+
+```{r train.and.predict, message=FALSE, results="hide"}
+require(tidyverse)
+library(xgboost)
+library(xgboostExplainer)
+
+set.seed(123)
+
+data(agaricus.train, package='xgboost')
+
+X = as.matrix(agaricus.train$data)
+y = agaricus.train$label
+table(y)
+train_idx = 1:5000
+
+train.data = X[train_idx,]
+test.data = X[-train_idx,]
+
+xgb.train.data <- xgb.DMatrix(train.data, label = y[train_idx])
+xgb.test.data <- xgb.DMatrix(test.data)
+
+param <- list(objective = "binary:logistic")
+xgb.model <- xgboost(param =param,  data = xgb.train.data, nrounds=3)
+
+```
+
+`buildExplainer()`で、学習したxgboostのモデルから予測ルールを抽出する。
+
+```{r, results="hide"}
+library(xgboostExplainer)
+
+explainer = buildExplainer(xgb.model,xgb.train.data, type="binary", base_score = 0.5, trees = NULL)
+
+```
+
+
+## 指定したインスタンスの予測結果を予測ルールから分解再構成する
+
+指定したインスタンスの予測結果を、`buildExplainer()`が再構成した結果(rules breakdown)を眺める。
+
+```{r}
+# breakdown = explainPredictions(xgb.model, explainer, slice(DMatrix, as.integer(idx)))
+# function (xgb.model, explainer, data) 
+
+DMatrix = xgb.test.data
+idx = 2
+
+data = slice(DMatrix, as.integer(idx))
+
+```
+
+```{r}
+require(data.table)
+
+nodes = predict(xgb.model, data, predleaf = TRUE)
+  
+colnames = names(explainer)[1:(ncol(explainer) - 2)]
+  
+preds_breakdown = data.table(matrix(0, nrow = nrow(nodes), ncol = length(colnames)))
+setnames(preds_breakdown, colnames)
+  preds_breakdown %>% print()
+  
+  
+num_trees = ncol(nodes)
+
+cat("\n\nExtracting the breakdown of each prediction...\n")
+  
+for (x in 1:num_trees) {
+  print(x)
+  
+  nodes_for_tree = nodes[, x]
+  str(nodes_for_tree)
+  
+  tree_breakdown = explainer[tree == x - 1]
+  str(tree_breakdown)
+  
+  preds_breakdown_for_tree = 
+    tree_breakdown[match(nodes_for_tree, tree_breakdown$leaf), ]
+  str(preds_breakdown_for_tree)
+  
+  preds_breakdown = 
+    preds_breakdown + 
+    preds_breakdown_for_tree[,colnames, with = FALSE]
+  str(preds_breakdown)
+}
+
+```
+
+
+
+分解再構成した結果の可視化。
+```{r}
+showWaterfall(xgb.model, explainer, xgb.test.data, test.data,  2, type = "binary")
+
+```
+
+次回は、`buildExplainer()`が、どのような手続きで学習したxgboostのモデルから予測ルールを抽出しているのか詳細に見ていく。
