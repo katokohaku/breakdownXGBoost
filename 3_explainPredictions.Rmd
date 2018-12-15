@@ -25,20 +25,22 @@ knitr::opts_chunk$set(
 )
 ```
 
+# 目的
+
+今回は、インスタンスの予測結果が再構成されるプロセスをstep-by-stepで眺める。
+`buildExplainer()`の中身を抜き書きしながら、都度、**何から何が取り出されているか**見ていく。
+
+
 # 関連シリーズ
 
 1. [とりあえず使ってみる](http://kato-kohaku-0.hatenablog.com/entry/2018/12/14/002253)
-2. 予測結果の可視化プロセスをstep-by-stepで実行する（この記事）
-3. 予測結果のbreakdownをstep-by-stepで実行する
+2. [予測結果の可視化プロセスをstep-by-stepで実行する](http://kato-kohaku-0.hatenablog.com/entry/2018/12/14/231803)
+3. 予測結果を分解再構成するプロセスをstep-by-stepで実行する（この記事）
 4. 学習したxgboostのルール抽出をstep-by-stepで実行する
 
-# 目的
+# 準備
 
-今回は、インスタンスの予測結果を予測ルールから分解再構成するプロセスをstep-by-stepで眺める。
-`buildExplainer()`の中身を抜き書きしながら、都度、何が取り出されているか見ていく。
-
-
-## 準備：XGBモデルの学習と予測
+## XGBモデルの学習と予測
 
 `xgboostExplainer`のマニュアルにあるexampleからコピペ。
 
@@ -66,6 +68,7 @@ param <- list(objective = "binary:logistic")
 xgb.model <- xgboost(param =param,  data = xgb.train.data, nrounds=3)
 
 ```
+## 予測ルールを抽出する
 
 `buildExplainer()`で、学習したxgboostのモデルから予測ルールを抽出する。
 
@@ -76,12 +79,25 @@ explainer = buildExplainer(xgb.model,xgb.train.data, type="binary", base_score =
 
 ```
 
+# 結果を分解再構成する
 
-## 指定したインスタンスの予測結果を予測ルールから分解再構成する
+## overview
 
-指定したインスタンスの予測結果を、`buildExplainer()`が再構成した結果(rules breakdown)を眺める。
+指定したインスタンスの予測結果を、`buildExplainer()`が学習したモデルから再構成した結果(breakdown)を眺める。
+
+再構成の大まかな手順は以下の通り：
+
+1. 指定したインスタンスが各roundでどのleafに落ちるか予測結果を得る
+2. 各roundで該当するleafの各特徴量の予測値への貢献量(予測ルール)を得る
+3. 2を集計し、round全体での予測ルールを得る
+
+
+## 対象の予測
+
+今回は省略のため、1インスタンスだけを対象として指定するが、下記idxは複数のインスタンスを指定するベクトルでもよい。
 
 ```{r}
+require(data.table)
 # breakdown = explainPredictions(xgb.model, explainer, slice(DMatrix, as.integer(idx)))
 # function (xgb.model, explainer, data) 
 
@@ -90,49 +106,131 @@ idx = 2
 
 data = slice(DMatrix, as.integer(idx))
 
+nodes = predict(xgb.model, data, predleaf = TRUE)
+print(nodes)
+
 ```
 
-```{r}
-require(data.table)
+`xgboost:::predict.xgb.Booster()`は、`predleaf = TRUE`オプションを指定することで、あるインスタンスの予測時に、それぞれのroundのtreeでどのleafに落ちたか？を返してくれる
 
-nodes = predict(xgb.model, data, predleaf = TRUE)
-  
+## 初期化
+
+インスタンスの数（行）× Interceptを含むすべてのルール（列）からなるゼロ行列を準備する。
+
+```{r}
 colnames = names(explainer)[1:(ncol(explainer) - 2)]
   
 preds_breakdown = data.table(matrix(0, nrow = nrow(nodes), ncol = length(colnames)))
 setnames(preds_breakdown, colnames)
-  preds_breakdown %>% print()
-  
   
 num_trees = ncol(nodes)
 
 cat("\n\nExtracting the breakdown of each prediction...\n")
-  
-for (x in 1:num_trees) {
-  print(x)
-  
-  nodes_for_tree = nodes[, x]
-  str(nodes_for_tree)
-  
-  tree_breakdown = explainer[tree == x - 1]
-  str(tree_breakdown)
-  
-  preds_breakdown_for_tree = 
-    tree_breakdown[match(nodes_for_tree, tree_breakdown$leaf), ]
-  str(preds_breakdown_for_tree)
-  
-  preds_breakdown = 
-    preds_breakdown + 
-    preds_breakdown_for_tree[,colnames, with = FALSE]
-  str(preds_breakdown)
+
+preds_breakdown.init <- preds_breakdown
+```
+
+## 対象のtreeの取り出し
+
+今後のトレースを楽にするために「すべての行が0の列を削除し、残った列の列名を短縮する」関数を自作した。
+
+```{r}
+selectNonzeroToShort <- function(data, w=12){
+  select_if(data,
+            .predicate = function(x){ sum(abs(x)) > 0} , 
+            .funs = function(x){ str_trunc(x, width=w, side="left") }) 
 }
 
 ```
 
-
-
-分解再構成した結果の可視化。
+最初のtreeだけ少し丁寧にトレースする（残りは繰り返しなので省略）
 ```{r}
+x=1
+
+nodes_for_tree = nodes[, x]
+nodes_for_tree
+```
+
+`buildExplainer()`でとりだしたLeafのうち、このroundで対象となる木のLeafを列挙。
+
+```{r}
+tree_breakdown = explainer[tree == x - 1]
+tree_breakdown %>% selectNonzeroToShort()
+  
+
+```
+
+## 対象のleafのとりだし
+
+round=1のtreeのなかのLeaf ==`r nodes_for_tree`が、今回の予測ルール（予測値に各特徴量が寄与する変化量）。これを取り出して、`preds_breakdown`に足し合わせていく。
+
+```{r}
+preds_breakdown_for_tree = 
+  tree_breakdown[match(nodes_for_tree, tree_breakdown$leaf), ]
+
+print("preds_breakdown_for_tree")
+preds_breakdown_for_tree %>%  
+  selectNonzeroToShort(w=20) %>% 
+  glimpse()
+
+preds_breakdown = 
+  preds_breakdown + 
+  preds_breakdown_for_tree[,colnames, with = FALSE]
+
+print("preds_breakdown")
+preds_breakdown %>%  
+  selectNonzeroToShort(w=20) %>% 
+  glimpse()
+
+```
+
+すべてのroudsをまとめて実行すると、以下の通り。
+
+```{r}
+preds_breakdown <- preds_breakdown.init
+for (x in 1:num_trees) {
+  print(x)
+  
+  nodes_for_tree = nodes[, x]
+  tree_breakdown = explainer[tree == x - 1]
+
+  preds_breakdown_for_tree = 
+    tree_breakdown[match(nodes_for_tree, tree_breakdown$leaf), ]
+  
+  print("preds_breakdown_for_tree")
+  preds_breakdown_for_tree %>%  
+    selectNonzeroToShort(w=20) %>% 
+    glimpse()
+  
+  preds_breakdown = 
+    preds_breakdown + 
+    preds_breakdown_for_tree[,colnames, with = FALSE]
+  
+  print("preds_breakdown")
+  preds_breakdown %>%  
+    selectNonzeroToShort(w=20) %>% 
+    glimpse()
+}
+
+# return(preds_breakdown)
+
+
+```
+
+
+## 検算
+
+元実装の結果と合致してるか検算。分解再構成した結果の可視化。
+
+```{r}
+preds_breakdown %>% selectNonzeroToShort(w=20)
+
+weight <- sum(preds_breakdown)
+weight
+
+prediction <- exp(weight)/(1+exp(weight))
+prediction
+
 showWaterfall(xgb.model, explainer, xgb.test.data, test.data,  2, type = "binary")
 
 ```
