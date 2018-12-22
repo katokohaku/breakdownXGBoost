@@ -27,7 +27,7 @@ knitr::opts_chunk$set(
 
 # 目的
 
-今回は、`xgboostExplainer`によって、xgboostのモデルから**学習したモデルからルールがどうやって抽出されているか**にフォーカスして追いかける。
+今回は、`xgboostExplainer`によって、xgboostの学習済みモデルから**ルールがどうやって抽出されているか**にフォーカスして追いかける。
 
 # 関連シリーズ
 
@@ -37,9 +37,7 @@ knitr::opts_chunk$set(
 4. 予測結果のbreakdownをstep-by-stepで実行する
 
 
-# `buildExplainer()`の中身を抜き書きしながら眺める
-
-## 準備：XGBモデルの学習と予測
+# 準備：XGBモデルの学習と予測
 
 `xgboostExplainer`のマニュアルにあるexampleからコピペ。
 
@@ -68,9 +66,12 @@ xgb.model <- xgboost(param =param,  data = xgb.train.data, nrounds=3)
 
 ```
 
+
 # 学習したxgboostのルール抽出
 
-step-by-stepで実行していく
+
+`buildExplainer()`の中身を抜き書きしながら、step-by-stepで眺める
+
 
 ```{r}
 # explainer = buildExplainer(xgb.model,xgb.train.data, type="binary", base_score = 0.5, trees = NULL)
@@ -85,7 +86,7 @@ trees_idx = NULL
 
 ## モデルからパスを抽出
 
-[`xgboost::xgb.model.dt.tree()`](https://www.imsbio.co.jp/RGM/R_rdfile?f=xgboost/man/xgb.model.dt.tree.Rd&d=R_CC)を使う。
+[`xgboost::xgb.model.dt.tree()`](https://www.imsbio.co.jp/RGM/R_rdfile?f=xgboost/man/xgb.model.dt.tree.Rd&d=R_CC)を使う。Qualityはそのルールでのsplitによる不純度の改善力、Coverはそのルールの登場頻度くらいに思っておけばよい（投げ遣り）。
 
 ```{r}
 col_names = attr(trainingData, ".Dimnames")[[2]]
@@ -99,13 +100,14 @@ trees %>%
   mutate_at(.vars = vars("Quality","Cover"), .funs = round)
 
 ```
-
-[`predict()`](https://www.rdocumentation.org/packages/xgboost/versions/0.71.2/topics/predict.xgb.Booster)で訓練データのインスタンスが所属するLeafのノード番号を取得する。
+leafの内訳はこんな感じ。
 
 ```{r}
-trees %>% filter(Feature == "Leaf") %$% table(Node) 
+trees %>% filter(Feature == "Leaf")%>% select(Tree:Feature)
 ```
 
+
+[`predict(..., predleaf = TRUE)`](https://www.rdocumentation.org/packages/xgboost/versions/0.71.2/topics/predict.xgb.Booster)を指定することで、予測値の代わりに訓練データのインスタンスが各treeで所属するLeafのノード番号を取得できる。
 今回は`NROW(trainingData)=5000, nrounds = 3`なので、5000行3列の所属Leafの行列が得られる。
 
 ```{r}
@@ -116,10 +118,11 @@ nodes.train %>% dim()
 nodes.train <- NULL
 ```
 
-ただし、取得されたのち、この情報が使われている形跡が見当たらなかった。
+ただし、取得されたのち、学習に使われたインスタンスの予測結果の情報が、`buildExplainer()`のどこかで使われている形跡は見当たらなかった((この実装、全般的にレガシーが残っている傾向があって、追いかけていったら途中で行き止まりだった、みたいなことが、あちこちである))。
 
 ## 各roundの予測ルールを抽出・整理する
-`xgboostExplainer:::getStatsForTrees()`により処理される。
+
+`buildExplainer()`のエンジン部分。`xgboostExplainer:::getStatsForTrees()`により処理される。
 
 ```{r, eval=FALSE}
 # cat("\nBuilding the Explainer...")
@@ -128,36 +131,39 @@ tree_list = xgboostExplainer:::getStatsForTrees(trees, nodes.train, type = type,
 
 ```
 
-以下では、`xgboostExplainer:::getStatsForTrees()`の一連のステップをトレースする((関数内部でのデータの更新が、前提としてdata.table::copyによる`- attr(*, ".internal.selfref")=<externalptr>`で、参照渡しが行われているのに注意))
+以下では、`xgboostExplainer:::getStatsForTrees()`の一連のステップをトレースする。関数内部で`data.table::copy()'による`- attr(*, ".internal.selfref")=<externalptr>`によって、**データの更新が参照渡しとして行われている**のに注意((これがまたトレーサビリティを下げている))。
 
 ### Cover(H)の再計算
 
+`xgb.model.dt.tree()`の情報を根拠に予測値を算出するためのパスと予測値の更新量を取り出す。`xgb.model.dt.tree()`のCoverは精度に難がある((途中の丸め方に問題があるのかな))とのことで、予測に必要になるのでちゃんとした制度で計算しなおし。
+
 ```{r}
-tree_list = data.table::copy(trees)
-tree_list[, `:=`(leaf, Feature == "Leaf")]
-tree_list[, `:=`(H, Cover)]
-non.leaves = which(tree_list[, leaf] == F)
+tree_datatable = data.table::copy(trees)
+tree_datatable[, `:=`(leaf, Feature == "Leaf")]
+tree_datatable[, `:=`(H, Cover)]
+non.leaves = which(tree_datatable[, leaf] == F)
 
 cat("\n\nRecalculating the cover for each non-leaf... \n")
 
 for (i in rev(non.leaves)) {
-  left = tree_list[i, Yes]
-  right = tree_list[i, No]
-  tree_list[i, `:=`(H, tree_list[ID == left, H] + tree_list[ID == right, H])]
-  
+  left = tree_datatable[i, Yes]
+  right = tree_datatable[i, No]
+  tree_datatable[i, `:=`(H, tree_datatable[ID == left, H] + tree_datatable[ID == right, H])]
+  print(tree_datatable[i,])
 }
 
 base_weight = log(base_score/(1 - base_score))
   
-tree_list[leaf==T,weight:=base_weight + Quality]
+tree_datatable[leaf==T,weight:=base_weight + Quality]
 
-tree_list[,previous_weight:=base_weight]
-tree_list[1,previous_weight:=0]
+tree_datatable[,previous_weight:=base_weight]
+tree_datatable[1,previous_weight:=0]
 
-tree_list[leaf==T,G:=-weight*H]
+tree_datatable[leaf==T,G:=-weight*H]
+tree_datatable %>% str()
 
-tree_list = split(tree_list,as.factor(tree_list$Tree))
-
+tree_list = split(tree_datatable,as.factor(tree_datatable$Tree))
+tree_list %>% str()
 ```
 
 ```{r}
@@ -191,37 +197,41 @@ for (tree in tree_list){
 tree_list
 
 ```
-
-```{r}
+```{r, eval=FALSE}
 cat("\n\nSTEP 2 of 2")
 explainer = xgboostExplainer:::buildExplainerFromTreeList(tree_list, col_names)
-# function (tree_list, col_names)
 
 ```
+```{r, eval=TRUE}
+# explainer = xgboostExplainer:::buildExplainerFromTreeList(tree_list, col_names)
+# function (tree_list, col_names) 
+# {
+  
+tree_list_breakdown <- vector("list", length(col_names) + 3)
+names(tree_list_breakdown) = c(col_names, "intercept", "leaf", "tree")
+num_trees = length(tree_list)
 
-```{r, eval=FALSE}
-{
-  tree_list_breakdown <- vector("list", length(col_names) + 3)
-  names(tree_list_breakdown) = c(col_names, "intercept", "leaf", "tree")
-  num_trees = length(tree_list)
-  cat("\n\nGetting breakdown for each leaf of each tree...\n")
-  pb <- txtProgressBar(style = 3)
-  for (x in 1:num_trees) {
-    tree = tree_list[[x]]
-    tree_breakdown = getTreeBreakdown(tree, col_names)
-    tree_breakdown$tree = x - 1
-    tree_list_breakdown = rbindlist(append(list(tree_list_breakdown), list(tree_breakdown)))
-    setTxtProgressBar(pb, x/num_trees)
-  }
-  return(tree_list_breakdown)
+cat("\n\nGetting breakdown for each leaf of each tree...\n")
+
+for (x in 1:num_trees) {
+  tree = tree_list[[x]]
+  tree_breakdown = xgboostExplainer:::getTreeBreakdown(tree, col_names)
+  tree_breakdown$tree = x - 1
+  
+  tree_list_breakdown = 
+    data.table::rbindlist(append(list(tree_list_breakdown), list(tree_breakdown)))
+  
 }
 
+explainer = tree_list_breakdown
+# return(tree_list_breakdown)
+# }
+
 ```
 
+```{r}
 
-```{r, eval=FALSE}
 showWaterfall(xgb.model, explainer, xgb.test.data, test.data,  2, type = "binary")
 
 ```
 
-次回は、`xgboostExplainer`が抽出したルールをもとにどのような手続きで個別のインスタンスの予測結果を分解しているのか詳細に見ていく。
