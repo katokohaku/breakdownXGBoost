@@ -27,7 +27,13 @@ knitr::opts_chunk$set(
 
 # 目的
 
-今回は、`xgboostExplainer`によって、xgboostの学習済みモデルから**ルールがどうやって抽出されているか**にフォーカスして追いかける。
+今回は、`xgboostExplainer`によって、xgboostの学習済みモデルから**ルールがどうやって抽出されているか**にフォーカスし、適宜xgboostの資料を見ながら追いかける。
+
+Introduction to Boosted Trees (PDF)
+https://homes.cs.washington.edu/~tqchen/pdf/BoostedTree.pdf
+
+XGBoost: A Scalable Tree Boosting System
+https://arxiv.org/abs/1603.02754
 
 # 関連シリーズ
 
@@ -84,7 +90,7 @@ trees_idx = NULL
 
 ```
 
-## モデルからパスを抽出
+## xgb.model.dt.tree()によるパスを抽出
 
 [`xgboost::xgb.model.dt.tree()`](https://www.imsbio.co.jp/RGM/R_rdfile?f=xgboost/man/xgb.model.dt.tree.Rd&d=R_CC)を使う。
 
@@ -122,9 +128,12 @@ nodes.train <- NULL
 
 ただし、取得されたのち、学習に使われたインスタンスの予測結果の情報が、`buildExplainer()`のどこかで使われている形跡は見当たらなかった((この実装、全般的にレガシーが残っている傾向があって、追いかけていったら途中で行き止まりだった、みたいなことが、あちこちである))。
 
-## 各roundの予測ルールを抽出・整理する
+## 予測値の再分配
+
+`xgboostExplainer`は、Leafの予測値を親ノードに再分配することで、予測結果を分解・説明する。
 
 以下では、`buildExplainer()`のエンジン部分である`xgboostExplainer:::getStatsForTrees()`の一連のステップをトレースする。
+
 ```{r, eval=FALSE}
 
 # tree_list = xgboostExplainer:::getStatsForTrees(trees, nodes.train, type = type, base_score = base_score)
@@ -134,11 +143,13 @@ nodes.train <- NULL
 
 ```
 
-なお、関数内部で`data.table::copy()'による`- attr(*, ".internal.selfref")=<externalptr>`によって、**データの更新が参照渡しとして行われている**のに注意。これがまたトレーサビリティを下げている。
+なお、関数内部で`data.table::copy()'により、`- attr(*, ".internal.selfref")=<externalptr>`で、**データの更新が参照渡しとして行われている**のに注意。
 
-### Cover(H)の再計算
+## Cover (H)の再計算
 
-`xgb.model.dt.tree()`の情報を根拠に予測値を算出するためのパスと予測値の更新量を取り出す。`xgb.model.dt.tree()`のCoverは精度に難がある((途中の丸め方に問題があるのかな))とのことで、予測結果の分解に必要になるので、きちんととした精度で計算しなおす。
+`xgb.model.dt.tree()`の情報から、各ノードまでの二次の勾配の和を取り出す。これはCover列の情報そのもののはずなのだが、`xgb.model.dt.tree()`の出力するCoverは精度に問題がある((途中の丸め方に問題があるのかな))とのことで、きちんととした精度で計算しなおす。
+
+LeafノードのCoverから、逆向きにたどりながら足し合わせていけばよい
 
 ```{r}
 type = "binary"
@@ -170,32 +181,43 @@ for (i in rev(non.leaves)) {
       print()
     print.counter <- print.counter + 1
   }
-
 }
 
-
 ```
-```{r, results}
+
+CoverとHを比べてみると、たしかに足し算の結果がずれている..。
+
+## 勾配(G)とweightの再計算
+
+`xgboost::xgb.model.dt.tree()`の出力のうち、LeafノードではQualityのセルが**予測結果の格納場所として流用されている**ので、これを起点にして、各親ノードにweightを再分配する。
+
+定義上、$w^*_j=-\frac{G_j}{H_j+\lambda}$ なのだが、これ以降$\lambda$が入っていないので、$G_j = \sum_{i \in I_j}^{} g_i$ とは厳密な意味では違うのかもしれないが、ここは読み取れなかった。
+
+```{r, results="hide"}
 base_weight = log(base_score/(1 - base_score))
 
-tree_datatable[,previous_weight:=base_weight]
-tree_datatable[1,previous_weight:=0]
+tree_datatable[, previous_weight := base_weight]
+tree_datatable[1, previous_weight:=0]
 
-tree_datatable[leaf==T,weight:=base_weight + Quality]
+tree_datatable[leaf==T, weight := base_weight + Quality]
 
+tree_datatable[leaf==T, G := -weight * H]
 
-tree_datatable[leaf==T,G:=-weight*H]
+```
+```{r, include=FALSE}
 tree_datatable %>% 
   select(-Tree,-Node,-Feature,-Split,-Missing) %>% 
   knitr::kable()
-
 ```
+
+以降は、round(Tree)単位に分けて処理を進める。
 
 ```{r}
 tree_list = split(tree_datatable,as.factor(tree_datatable$Tree))
 tree_list %>% str(1)
 ```
 
+各roundのLeaf以外の親ノードの$G$を計算する。定義から、$I_j = I_{left, j}+I_{right, j}$ なので、$G_j = \sum_{i \in I_{left,j}}^{} g_i + \sum_{i \in I_{right,j}}^{} g_i = G_{L,j} + G_{R,j}$ の足し算を計算すればよい((論文中には、GR ← G － GL$と書いてある（Algrithm.1）))。
 
 ```{r}
 num_tree_list = length(tree_list)
@@ -220,47 +242,35 @@ for (tree in tree_list){
     tree[ID==left,previous_weight:=w]
     tree[ID==right,previous_weight:=w]
     
-    bind_rows(tree[r,], tree[ID==left,], tree[ID==right,]) %>% print()
+    # bind_rows(tree[r,], tree[ID==left,], tree[ID==right,]) %>% print()
   }
   
   tree[,uplift_weight:=weight-previous_weight]
   # setTxtProgressBar(pb, t / num_tree_list)
 }
 
-tree_list %>% str(3)
+tree_list %>% str(1)
 
 ```
-```{r, eval=FALSE}
+
+## Tree Breakdownの構築
+
+`buildExplainerFromTreeList()`を実行すると、
+
+* 各treeで`getTreeBreakdown()`が呼ばれ、
+    * 各Leafで` getLeafBreakdown()`が呼ばれ、
+        * `findPath()`がLeaf → root node までのパスを取得
+        * Leaf → root nodeまでのupliftに基づいて、各パスのImpactを集計
+        * root nodeのupliftをInterceptとする
+
+```{r}
 cat("\n\nSTEP 2 of 2")
 explainer = xgboostExplainer:::buildExplainerFromTreeList(tree_list, col_names)
 
+explainer %>% str(0)
 ```
-```{r, eval=TRUE}
-# explainer = xgboostExplainer:::buildExplainerFromTreeList(tree_list, col_names)
-# function (tree_list, col_names) 
-# {
-  
-tree_list_breakdown <- vector("list", length(col_names) + 3)
-names(tree_list_breakdown) = c(col_names, "intercept", "leaf", "tree")
-num_trees = length(tree_list)
 
-cat("\n\nGetting breakdown for each leaf of each tree...\n")
-
-for (x in 1:num_trees) {
-  tree = tree_list[[x]]
-  tree_breakdown = xgboostExplainer:::getTreeBreakdown(tree, col_names)
-  tree_breakdown$tree = x - 1
-  
-  tree_list_breakdown = 
-    data.table::rbindlist(append(list(tree_list_breakdown), list(tree_breakdown)))
-  
-}
-
-explainer = tree_list_breakdown
-# return(tree_list_breakdown)
-# }
-
-```
+本質的な部分ではないので、step-by-stepは省略。`explainer`の中身は以前見た通り。
 
 ```{r}
 
