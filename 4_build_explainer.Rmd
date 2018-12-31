@@ -86,7 +86,7 @@ trees_idx = NULL
 
 ## モデルからパスを抽出
 
-[`xgboost::xgb.model.dt.tree()`](https://www.imsbio.co.jp/RGM/R_rdfile?f=xgboost/man/xgb.model.dt.tree.Rd&d=R_CC)を使う。Qualityはそのルールでのsplitによる不純度の改善力、Coverはそのルールの登場頻度くらいに思っておけばよい（投げ遣り）。
+[`xgboost::xgb.model.dt.tree()`](https://www.imsbio.co.jp/RGM/R_rdfile?f=xgboost/man/xgb.model.dt.tree.Rd&d=R_CC)を使う。
 
 ```{r}
 col_names = attr(trainingData, ".Dimnames")[[2]]
@@ -96,16 +96,18 @@ cat("\nCreating the trees of the xgboost model...")
 trees = xgb.model.dt.tree(col_names, model = xgb.model, trees = trees_idx)
 
 trees %>% 
-  mutate(Feature = str_trunc(Feature, width=12, side="left")) %>%
-  mutate_at(.vars = vars("Quality","Cover"), .funs = round)
+  mutate(Feature = str_trunc(Feature, width=12, side="left")) %>% 
+  select(-Missing)
+# %>%
+#   mutate_at(.vars = vars("Quality","Cover"), .funs = round)
 
 ```
-leafの内訳はこんな感じ。
 
-```{r}
-trees %>% filter(Feature == "Leaf")%>% select(Tree:Feature)
-```
+「LeafノードのQualityは0じゃないの？」と思うかもしれないが、マニュアルに
 
+> Quality: either the split gain (change in loss) **or the leaf value**
+
+と書いてあり、LeafノードではQualityのセルが**予測結果の格納場所として流用されている**ことに注意。（あとからこれを利用する）((論文を読んでからコードを読み進めていて、ここではまった。))
 
 [`predict(..., predleaf = TRUE)`](https://www.rdocumentation.org/packages/xgboost/versions/0.71.2/topics/predict.xgb.Booster)を指定することで、予測値の代わりに訓練データのインスタンスが各treeで所属するLeafのノード番号を取得できる。
 今回は`NROW(trainingData)=5000, nrounds = 3`なので、5000行3列の所属Leafの行列が得られる。
@@ -122,49 +124,78 @@ nodes.train <- NULL
 
 ## 各roundの予測ルールを抽出・整理する
 
-`buildExplainer()`のエンジン部分。`xgboostExplainer:::getStatsForTrees()`により処理される。
-
+以下では、`buildExplainer()`のエンジン部分である`xgboostExplainer:::getStatsForTrees()`の一連のステップをトレースする。
 ```{r, eval=FALSE}
-# cat("\nBuilding the Explainer...")
-# cat("\n\nSTEP 2 of 2")
-tree_list = xgboostExplainer:::getStatsForTrees(trees, nodes.train, type = type, base_score = base_score)
+
+# tree_list = xgboostExplainer:::getStatsForTrees(trees, nodes.train, type = type, base_score = base_score)
+# function (trees, nodes.train, type = "binary", base_score = 0.5) 
+# {
+
 
 ```
 
-以下では、`xgboostExplainer:::getStatsForTrees()`の一連のステップをトレースする。関数内部で`data.table::copy()'による`- attr(*, ".internal.selfref")=<externalptr>`によって、**データの更新が参照渡しとして行われている**のに注意((これがまたトレーサビリティを下げている))。
+なお、関数内部で`data.table::copy()'による`- attr(*, ".internal.selfref")=<externalptr>`によって、**データの更新が参照渡しとして行われている**のに注意。これがまたトレーサビリティを下げている。
 
 ### Cover(H)の再計算
 
-`xgb.model.dt.tree()`の情報を根拠に予測値を算出するためのパスと予測値の更新量を取り出す。`xgb.model.dt.tree()`のCoverは精度に難がある((途中の丸め方に問題があるのかな))とのことで、予測に必要になるのでちゃんとした制度で計算しなおし。
+`xgb.model.dt.tree()`の情報を根拠に予測値を算出するためのパスと予測値の更新量を取り出す。`xgb.model.dt.tree()`のCoverは精度に難がある((途中の丸め方に問題があるのかな))とのことで、予測結果の分解に必要になるので、きちんととした精度で計算しなおす。
 
 ```{r}
+type = "binary"
+base_score = 0.5
+
 tree_datatable = data.table::copy(trees)
-tree_datatable[, `:=`(leaf, Feature == "Leaf")]
-tree_datatable[, `:=`(H, Cover)]
+
+tree_datatable[, leaf := (Feature == "Leaf")]
 non.leaves = which(tree_datatable[, leaf] == F)
 
-cat("\n\nRecalculating the cover for each non-leaf... \n")
+tree_datatable[, H := Cover]
 
+cat("\n\nRecalculating the cover for each non-leaf... \n")
+print.counter = 1
 for (i in rev(non.leaves)) {
   left = tree_datatable[i, Yes]
   right = tree_datatable[i, No]
-  tree_datatable[i, `:=`(H, tree_datatable[ID == left, H] + tree_datatable[ID == right, H])]
-  print(tree_datatable[i,])
+  
+  tree_datatable[i, H := (tree_datatable[ID == left, H] + 
+                            tree_datatable[ID == right, H])]
+  
+  if(print.counter < 5){
+    print(i - 1)
+    
+    bind_rows(tree_datatable[i, ],
+              tree_datatable[ID == left, ], 
+              tree_datatable[ID == right,]) %>% 
+      select(-Tree,-Node,-Feature,-Split,-Missing) %>% 
+      print()
+    print.counter <- print.counter + 1
+  }
+
 }
 
+
+```
+```{r, results}
 base_weight = log(base_score/(1 - base_score))
-  
-tree_datatable[leaf==T,weight:=base_weight + Quality]
 
 tree_datatable[,previous_weight:=base_weight]
 tree_datatable[1,previous_weight:=0]
 
-tree_datatable[leaf==T,G:=-weight*H]
-tree_datatable %>% str()
+tree_datatable[leaf==T,weight:=base_weight + Quality]
 
-tree_list = split(tree_datatable,as.factor(tree_datatable$Tree))
-tree_list %>% str()
+
+tree_datatable[leaf==T,G:=-weight*H]
+tree_datatable %>% 
+  select(-Tree,-Node,-Feature,-Split,-Missing) %>% 
+  knitr::kable()
+
 ```
+
+```{r}
+tree_list = split(tree_datatable,as.factor(tree_datatable$Tree))
+tree_list %>% str(1)
+```
+
 
 ```{r}
 num_tree_list = length(tree_list)
@@ -188,13 +219,15 @@ for (tree in tree_list){
     tree[r,weight:=w]
     tree[ID==left,previous_weight:=w]
     tree[ID==right,previous_weight:=w]
+    
+    bind_rows(tree[r,], tree[ID==left,], tree[ID==right,]) %>% print()
   }
   
   tree[,uplift_weight:=weight-previous_weight]
   # setTxtProgressBar(pb, t / num_tree_list)
 }
 
-tree_list
+tree_list %>% str(3)
 
 ```
 ```{r, eval=FALSE}
