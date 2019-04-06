@@ -1,0 +1,67 @@
+---
+title: "XGBoostExplainerが何をやっているか調べる"
+author: Satoshi Kato (@katokohaku)
+output: 
+  html_document:
+    keep_md: yes
+    toc: yes
+  md_document:
+    variant: markdown_github
+---
+
+```{r setup, include=FALSE}
+require(tidyverse)
+require(magrittr)
+
+knitr::opts_knit$set(
+  progress = TRUE, 
+  verbose = TRUE, 
+  root.dir = "."
+)
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE
+)
+```
+
+
+## インストール
+
+本家の記事に従ってgithubからインストール
+
+```{r install.package, eval=FALSE}
+# install.packages("devtools") 
+devtools::install_github(repo = "lantanacamara/lightgbmExplainer")  
+```
+## XGBモデルの学習と予測
+
+いつもの食えるキノコと毒キノコの2値分類。
+
+```{r train.and.predict, message=FALSE, results="hide"}
+library(lightgbm) # v2.1.0 or above
+
+# Load Data
+data(agaricus.train, package = "lightgbm")
+# Train a model
+lgb.dtrain <- lgb.Dataset(agaricus.train$data, label = agaricus.train$label)
+lgb.params <- list(objective = "binary")
+lgb.model <- lgb.train(lgb.params, lgb.dtrain, 5)
+
+```
+
+## 予測の可視化
+
+```{r}
+library(lightgbmExplainer)
+
+# Build Explainer
+lgb.trees <- lgb.model.dt.tree(lgb.model) # First get a lgb tree
+explainer <- buildExplainer(lgb.trees)
+# compute contribution for each data point
+pred.breakdown <- explainPredictions(lgb.model, explainer, agaricus.train$data)
+# Show waterfall for the 8th observation
+showWaterfall(lgb.model, explainer, lgb.dtrain, agaricus.train$data,  8, type = "binary")
+
+```
+
