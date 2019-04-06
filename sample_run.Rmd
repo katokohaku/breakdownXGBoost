@@ -1,0 +1,86 @@
+---
+title: "XGBoostExplainer‚ª‰½‚ð‚â‚Á‚Ä‚¢‚é‚©’²‚×‚é"
+author: Satoshi Kato (@katokohaku)
+output: 
+  html_document:
+    keep_md: yes
+    toc: yes
+  md_document:
+    variant: markdown_github
+---
+
+```{r setup, include=FALSE}
+require(tidyverse)
+require(magrittr)
+
+knitr::opts_knit$set(
+  progress = TRUE, 
+  verbose = TRUE, 
+  root.dir = "."
+)
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE
+)
+```
+
+```{r train.and.predict, message=FALSE}
+require(tidyverse)
+library(xgboost)
+library(xgboostExplainer)
+
+set.seed(123)
+
+data(agaricus.train, package='xgboost')
+
+train <- agaricus.train
+
+X = train$data
+y = train$label
+
+bst <- xgboost(data = train$data, label = train$label, max.depth = 2,
+               eta = 1, nthread = 2, nround = 2,objective = "binary:logistic")
+
+trees <- xgb.model.dt.tree(agaricus.train$data@Dimnames[[2]], model = bst)
+trees %>% 
+  mutate(Feature = str_trunc(Feature, width=12, side="left")) %>% 
+  select(-Split, -Missing) 
+
+p = rep(0.5,nrow(X))
+
+L = which(X[,'odor=none']==0)
+R = which(X[,'odor=none']==1)
+
+pL = p[L]
+pR = p[R]
+
+
+yL = y[L]
+yR = y[R]
+
+GL = sum(pL-yL)
+GL
+GR = sum(pR-yR)
+GR
+G = sum(p-y)
+G
+
+HL = sum(pL*(1-pL))
+HL
+HR = sum(pR*(1-pR))
+HR
+H = sum(p*(1-p))
+H
+
+gain = 0.5 * (GL^2/HL+GR^2/HR-G^2/H)
+gain
+gain *2
+
+
+gain2 = 0.5 * (GL^2 / (HL+1) + GR^2 / (HR+1) - G^2/ (H+1))
+gain2
+gain2*2
+```
+
+
