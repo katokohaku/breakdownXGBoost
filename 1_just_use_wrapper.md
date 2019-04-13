@@ -61,7 +61,6 @@ install_github("AppliedDataSciencePartners/xgboostExplainer")
 
 ```r
 library(xgboost)
-#> Warning: package 'xgboost' was built under R version 3.5.3
 require(tidyverse)
 library(xgboost)
 library(xgboostExplainer)

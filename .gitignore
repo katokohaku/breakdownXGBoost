@@ -2,7 +2,5 @@
 .Rhistory
 .RData
 .Ruserdata
-*.html
-*files/*
 1_just_use_wrapper.Rmd
 sample_run.Rmd

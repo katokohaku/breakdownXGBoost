@@ -250,7 +250,11 @@ if (abs(other_impact) > 0) {
   labels[1] = "intercept"
 }
 
-breakdown_summary
+breakdown_summary %>% t()
+#>       intercept gill-size=broad  odor=foul odor=none odor=anise
+#> [1,] -0.2708466         1.61423 -0.6712935 0.4540875  0.1362809
+#>      odor=almond cap-color=yellow
+#> [1,]   0.1307301       0.06468987
 ```
 
 Šæ’£‚Á‚Ä•À‚Ñ‘Ö‚¦‚½B
