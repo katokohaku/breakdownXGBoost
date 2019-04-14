@@ -1,5 +1,5 @@
 ---
-title: "XGBoostExplainerが何をやっているか調べる"
+title: "lightgbmExplainerが何をやっているか調べる"
 author: Satoshi Kato (@katokohaku)
 output: 
   html_document:
@@ -34,7 +34,7 @@ knitr::opts_chunk$set(
 # install.packages("devtools") 
 devtools::install_github(repo = "lantanacamara/lightgbmExplainer")  
 ```
-## XGBモデルの学習と予測
+## lightgbmモデルの学習と予測
 
 いつもの食えるキノコと毒キノコの2値分類。
 
